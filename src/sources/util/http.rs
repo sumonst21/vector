@@ -4,15 +4,20 @@ use crate::{
     tls::{MaybeTlsSettings, TlsConfig},
 };
 use futures::{
-    compat::{AsyncRead01CompatExt, Future01CompatExt, Stream01CompatExt},
-    FutureExt, TryFutureExt, TryStreamExt,
+    // compat::{AsyncRead01CompatExt, Future01CompatExt, Stream01CompatExt},
+    compat::Future01CompatExt,
+    FutureExt,
+    // StreamExt,
+    TryFutureExt,
+    TryStreamExt,
 };
 use futures01::{sync::mpsc, Sink};
 use serde::Serialize;
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+// use tokio_util::compat::FuturesAsyncReadCompatExt;
+use async_trait::async_trait;
 use warp::{
     filters::BoxedFilter,
     http::{HeaderMap, StatusCode},
@@ -49,6 +54,7 @@ impl fmt::Debug for RejectShuttingDown {
 }
 impl warp::reject::Reject for RejectShuttingDown {}
 
+#[async_trait]
 pub trait HttpSource: Clone + Send + Sync + 'static {
     fn build_event(
         &self,
@@ -56,7 +62,7 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         header_map: HeaderMap,
     ) -> Result<Vec<Event>, ErrorMessage>;
 
-    fn run(
+    async fn run(
         self,
         address: SocketAddr,
         path: &'static str,
@@ -116,13 +122,19 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
 
         info!(message = "building http server", addr = %address);
 
-        let tls = MaybeTlsSettings::from_config(tls, true).unwrap();
-        let incoming = tls.bind(&address).unwrap().incoming();
+        let tls = MaybeTlsSettings::from_config(tls, true)?;
+        let mut listener = tls.bind(&address).await?;
+        // TODO: handshake in stream is not ok
+        let incoming = listener.incoming().and_then(|mut connection| async move {
+            connection.handshake().await.and_then(|_| Ok(connection))
+        });
+        // use std::sync::Arc;
 
         let fut = async move {
             let _ = warp::serve(routes)
                 .serve_incoming_with_graceful_shutdown(
-                    incoming.compat().map_ok(|s| s.compat().compat()),
+                    incoming,
+                    // incoming.compat().map_ok(|s| s.compat().compat()),
                     shutdown.clone().compat().map(|_| ()),
                 )
                 .await;

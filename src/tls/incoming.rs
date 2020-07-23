@@ -1,61 +1,26 @@
 use super::{
-    CreateAcceptor, IncomingListener, MaybeTlsSettings, MaybeTlsStream, PeerAddress, Result,
-    TcpBind, TlsError, TlsSettings,
+    CreateAcceptor, Handshake, MaybeTls, MaybeTlsSettings, MaybeTlsStream, PeerAddress,
+    Result as TlsResult, TcpBind, TlsError, TlsSettings,
 };
-use futures01::{try_ready, Async, Future, Stream};
-use openssl::ssl::{HandshakeError, SslAcceptor, SslMethod};
+use bytes05::{Buf, BufMut};
+use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
+use openssl::ssl::{SslAcceptor, SslMethod};
+use pin_project::pin_project;
 use snafu::ResultExt;
 use std::{
-    fmt::{self, Debug, Formatter},
-    io::{self, ErrorKind, Read, Write},
+    mem::MaybeUninit,
     net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
 };
-use tokio01::{
-    io::{AsyncRead, AsyncWrite},
+use tokio::{
+    io::{self, AsyncRead, AsyncWrite},
     net::{tcp::Incoming, TcpListener, TcpStream},
 };
-use tokio_openssl03::{AcceptAsync, SslAcceptorExt};
-
-pub(crate) struct MaybeTlsIncoming<I: Stream> {
-    incoming: I,
-    acceptor: Option<SslAcceptor>,
-}
-
-impl<I: Stream> MaybeTlsIncoming<I> {
-    pub(crate) fn new(incoming: I, acceptor: Option<SslAcceptor>) -> Self {
-        Self { incoming, acceptor }
-    }
-}
-
-impl Stream for MaybeTlsIncoming<Incoming> {
-    type Item = MaybeTlsIncomingStream<TcpStream>;
-    type Error = TlsError;
-
-    fn poll(&mut self) -> Result<Async<Option<Self::Item>>> {
-        Ok(Async::Ready(
-            match try_ready!(self
-                .incoming
-                .poll()
-                .map_err(Into::into)
-                .context(IncomingListener))
-            {
-                Some(stream) => Some(MaybeTlsIncomingStream::new(stream, &self.acceptor)?),
-                None => None,
-            },
-        ))
-    }
-}
-
-impl<I: Stream + Debug> Debug for MaybeTlsIncoming<I> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        f.debug_struct("MaybeTlsIncoming")
-            .field("incoming", &self.incoming)
-            .finish()
-    }
-}
+use tokio_openssl::{HandshakeError, SslStream};
 
 impl TlsSettings {
-    pub(crate) fn acceptor(&self) -> Result<SslAcceptor> {
+    pub(crate) fn acceptor(&self) -> TlsResult<SslAcceptor> {
         match self.identity {
             None => Err(TlsError::MissingRequiredIdentity),
             Some(_) => {
@@ -69,8 +34,8 @@ impl TlsSettings {
 }
 
 impl MaybeTlsSettings {
-    pub(crate) fn bind(&self, addr: &SocketAddr) -> Result<MaybeTlsListener> {
-        let listener = TcpListener::bind(addr).context(TcpBind)?;
+    pub(crate) async fn bind(&self, addr: &SocketAddr) -> TlsResult<MaybeTlsListener> {
+        let listener = TcpListener::bind(addr).await.context(TcpBind)?;
 
         let acceptor = match self {
             Self::Tls(tls) => Some(tls.acceptor()?),
@@ -81,18 +46,58 @@ impl MaybeTlsSettings {
     }
 }
 
+// #[pin_project]
+// pub(crate) struct MaybeTlsIncoming {
+//     listener: MaybeTlsIncoming,
+//     stream: Option<Incoming>,
+// }
+
+// impl Stream for MaybeTlsIncoming {
+//     type Item = TlsResult<MaybeTlsIncomingStream<TcpStream>>;
+
+//     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+//         let s = Pin::new(self.project().incoming.as_mut());
+//         Poll::Pending
+//         // let (socket, _) = ready!(self.inner.poll_accept(cx))?;
+//         // Poll::Ready(Some(Ok(socket)))
+//     }
+// }
+
 pub(crate) struct MaybeTlsListener {
     listener: TcpListener,
     acceptor: Option<SslAcceptor>,
 }
 
 impl MaybeTlsListener {
-    pub(crate) fn incoming(self) -> MaybeTlsIncoming<Incoming> {
-        let incoming = self.listener.incoming();
-        MaybeTlsIncoming::new(incoming, self.acceptor)
+    // pub(crate) fn incoming(self) -> MaybeTlsIncoming {
+    //     let incoming = MaybeTlsIncoming {
+    //         listener: self,
+    //         incoming: None,
+    //     };
+    //     incoming.incoming = Some(incoming.listener.incoming());
+    //     incoming
+    //     // let acceptor = self.acceptor.clone();
+    //     // self.listener
+    //     //     .incoming()
+    //     //     .map(move |connection| match connection {
+    //     //         Ok(stream) => MaybeTlsIncomingStream::new(stream, acceptor.clone()),
+    //     //         Err(source) => Err(TlsError::IncomingListener { source }),
+    //     //     })
+    // }
+
+    pub(crate) fn incoming(
+        &mut self,
+    ) -> impl Stream<Item = TlsResult<MaybeTlsIncomingStream<TcpStream>>> + '_ {
+        let acceptor = self.acceptor.clone();
+        self.listener
+            .incoming()
+            .map(move |connection| match connection {
+                Ok(stream) => MaybeTlsIncomingStream::new(stream, acceptor.clone()),
+                Err(source) => Err(TlsError::IncomingListener { source }),
+            })
     }
 
-    pub(crate) fn local_addr(&self) -> std::result::Result<SocketAddr, std::io::Error> {
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.listener.local_addr()
     }
 }
@@ -106,17 +111,20 @@ impl From<TcpListener> for MaybeTlsListener {
     }
 }
 
+#[pin_project]
 pub struct MaybeTlsIncomingStream<S> {
+    #[pin]
     state: StreamState<S>,
-    // AcceptAsync doesn't allow access to the inner stream, but users
+    // BoxFuture doesn't allow access to the inner stream, but users
     // of MaybeTlsIncomingStream want access to the peer address while
     // still handshaking, so we have to cache it here.
     peer_addr: SocketAddr,
 }
 
+#[pin_project(project = StreamStateProj)]
 enum StreamState<S> {
-    Accepted(MaybeTlsStream<S>),
-    Accepting(AcceptAsync<S>),
+    Accepted(#[pin] MaybeTlsStream<S>),
+    Accepting(BoxFuture<'static, Result<SslStream<S>, HandshakeError<S>>>),
 }
 
 impl<S> MaybeTlsIncomingStream<S> {
@@ -127,99 +135,93 @@ impl<S> MaybeTlsIncomingStream<S> {
     /// None if connection still hasen't been established.
     pub fn get_ref(&self) -> Option<&S> {
         match &self.state {
-            StreamState::Accepted(stream) => {
-                if let Some(raw) = stream.raw() {
-                    Some(raw)
-                } else {
-                    Some(
-                        stream
-                            .tls()
-                            .expect("Stream not raw nor tls")
-                            .get_ref()
-                            .get_ref(),
-                    )
-                }
-            }
+            StreamState::Accepted(stream) => Some(match stream {
+                MaybeTls::Raw(s) => s,
+                MaybeTls::Tls(s) => s.get_ref(),
+            }),
             StreamState::Accepting(_) => None,
         }
     }
 }
 
 impl MaybeTlsIncomingStream<TcpStream> {
-    pub(super) fn new(stream: TcpStream, acceptor: &Option<SslAcceptor>) -> Result<Self> {
+    pub(super) fn new(stream: TcpStream, acceptor: Option<SslAcceptor>) -> TlsResult<Self> {
         let peer_addr = stream.peer_addr().context(PeerAddress)?;
         let state = match acceptor {
-            Some(acceptor) => StreamState::Accepting(acceptor.accept_async(stream)),
+            Some(acceptor) => StreamState::Accepting(
+                async move { tokio_openssl::accept(&acceptor, stream).await }.boxed(),
+            ),
             None => StreamState::Accepted(MaybeTlsStream::Raw(stream)),
         };
         Ok(Self { peer_addr, state })
     }
-}
 
-fn poll_handshake<S: Read + Write>(acceptor: &mut AcceptAsync<S>) -> io::Result<StreamState<S>> {
-    match acceptor.poll() {
-        Err(error) => match error {
-            HandshakeError::WouldBlock(_) => Err(io::Error::new(
-                ErrorKind::WouldBlock,
-                TlsError::HandshakeNotReady,
-            )),
-            HandshakeError::Failure(stream) => Err(io::Error::new(
-                ErrorKind::Other,
-                TlsError::Handshake {
-                    source: stream.into_error(),
-                },
-            )),
-            HandshakeError::SetupFailure(source) => Err(io::Error::new(
-                ErrorKind::Other,
-                TlsError::HandshakeSetup { source },
-            )),
-        },
-        Ok(Async::Ready(stream)) => Ok(StreamState::Accepted(MaybeTlsStream::Tls(stream))),
-        Ok(Async::NotReady) => Err(io::Error::new(
-            ErrorKind::WouldBlock,
-            TlsError::HandshakeNotReady,
-        )),
+    pub(crate) async fn handshake(&mut self) -> TlsResult<()> {
+        if let StreamState::Accepting(fut) = &mut self.state {
+            let stream = fut.await.context(Handshake)?;
+            self.state = StreamState::Accepted(MaybeTlsStream::Tls(stream));
+        }
+
+        Ok(())
     }
 }
 
-impl<S: Read + Write> Read for MaybeTlsIncomingStream<S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.state {
-            StreamState::Accepted(stream) => stream.read(buf),
-            StreamState::Accepting(acceptor) => {
-                self.state = poll_handshake(acceptor)?;
-                self.read(buf)
+impl<S> StreamState<S> {
+    fn get_stream(self: Pin<&mut StreamState<S>>) -> Pin<&mut MaybeTlsStream<S>> {
+        match self.project() {
+            StreamStateProj::Accepted(stream) => stream,
+            StreamStateProj::Accepting(_) => {
+                unreachable!("Need call `MaybeTlsIncomingStream::handshake` first.")
             }
         }
     }
 }
 
-impl<S: Read + Write> Write for MaybeTlsIncomingStream<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match &mut self.state {
-            StreamState::Accepted(stream) => stream.write(buf),
-            StreamState::Accepting(acceptor) => {
-                self.state = poll_handshake(acceptor)?;
-                self.write(buf)
+impl AsyncRead for MaybeTlsIncomingStream<TcpStream> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.project().state.get_stream().poll_read(cx, buf)
+    }
+
+    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [MaybeUninit<u8>]) -> bool {
+        match &self.state {
+            StreamState::Accepted(s) => s.prepare_uninitialized_buffer(buf),
+            StreamState::Accepting(_) => {
+                unreachable!("Need call `MaybeTlsIncomingStream::handshake` first.")
             }
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        match &mut self.state {
-            StreamState::Accepted(stream) => stream.flush(),
-            StreamState::Accepting(_) => Ok(()),
-        }
+    fn poll_read_buf<B: BufMut>(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>> {
+        self.project().state.get_stream().poll_read_buf(cx, buf)
     }
 }
 
-impl<S: Read + Write> AsyncRead for MaybeTlsIncomingStream<S> {}
+impl AsyncWrite for MaybeTlsIncomingStream<TcpStream> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.project().state.get_stream().poll_write(cx, buf)
+    }
 
-impl<S: AsyncRead + AsyncWrite> AsyncWrite for MaybeTlsIncomingStream<S> {
-    fn shutdown(&mut self) -> io::Result<Async<()>> {
-        match &mut self.state {
-            StreamState::Accepted(stream) => stream.shutdown(),
-            StreamState::Accepting(_) => Ok(Async::Ready(())),
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.project().state.get_stream().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.project().state.get_stream().poll_shutdown(cx)
+    }
+
+    fn poll_write_buf<B: Buf>(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>> {
+        self.project().state.get_stream().poll_write_buf(cx, buf)
     }
 }
